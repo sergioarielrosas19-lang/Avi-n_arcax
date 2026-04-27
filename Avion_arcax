@@ -1,0 +1,1047 @@
+# avion_arcade_full.py
+# Juego "Arcade Avión - La Última Resistencia"
+# - 10 niveles
+# - Intro con historia
+# - Fondo estrellado por nivel
+# - Muchos enemigos pequeños (más en nivel 1)
+# - Jefes únicos por nivel (forma/color/animación)
+# - Aliados en el nivel final que se mueven, disparan y pueden morir
+# - Menú, selección de niveles (bloqueados hasta desbloquear), pausa, reintentar
+# - Guardado de progreso (progress.json)
+# - Efectos de sonido (carpeta sfx/). Si faltan, el juego sigue sin sonido.
+
+import pygame
+import random
+import math
+import json
+import os
+import sys
+from collections import deque
+
+# ---------------- CONFIG ----------------
+WIDTH, HEIGHT = 720, 1280
+FPS = 60
+
+SAVE_FILE = "progress.json"
+MAX_LEVEL = 10
+
+SHOT_DELAY_BASE = 160
+MIN_SHOT_DELAY = 48
+MAX_SHOT_LEVEL = 3
+UPGRADE_MAX_LEVEL = 3
+
+MAX_LIVES = 5
+SHIELD_DURATION_BASE = 3800  # ms base (se incrementó según pedido)
+MAX_SHIELD_DURATION = 8000
+
+MAX_PLAYER_BULLETS = 120
+MAX_ENEMY_BULLETS = 240
+
+BASE_MAX_ENEMIES = 18
+EXTRA_ENEMIES_LEVEL1 = 18
+
+BOSS_SPAWN_DELAY_MS = 3000  # jefes demoran más en aparecer
+INVULN_ON_LEVEL_START = 1200
+INVULN_ON_BOSS_SPAWN = 1800
+
+OFFSCREEN_MARGIN = 240
+NUM_STARS = 170
+MAX_PARTICLES = 300
+
+# SFX config (archivos deben estar en ./sfx/)
+SFX_FOLDER = "sfx"
+SFX_SHOOT_FILE = os.path.join(SFX_FOLDER, "shoot.wav")
+SFX_EXPLOSION_FILE = os.path.join(SFX_FOLDER, "explosion.wav")
+SFX_LEVELUP_FILE = os.path.join(SFX_FOLDER, "levelup.wav")
+SFX_PLAYER_DEATH_FILE = os.path.join(SFX_FOLDER, "player_death.wav")
+SFX_VOLUME = 0.6
+
+# ---------------- INIT PYGAME ----------------
+pygame.init()
+try:
+    pygame.mixer.init()
+except Exception:
+    # si falla el mixer, seguimos sin sonido (no crashea)
+    pass
+
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Arcade Avión - La Última Resistencia")
+clock = pygame.time.Clock()
+font = pygame.font.SysFont("arial", 22)
+big_font = pygame.font.SysFont("arial", 56)
+huge_font = pygame.font.SysFont("arial", 86)
+
+pause_button = pygame.Rect(WIDTH-60, 20, 40, 40)
+
+# ---------------- GAME STATE ----------------
+score = 0
+lives = MAX_LIVES
+level = 1
+unlocked_levels = 1
+total_kills = 0
+enemy_kills_for_boss = 0
+
+shield = 0.0
+shield_start_time = 0
+
+upgrade_levels = {"shot": 0, "firerate": 0}
+next_upgrade_at = 20
+
+screen_state = "intro"  # intro, menu, level_select, playing, paused, upgrade, gameover, victory
+
+invulnerable_until = 0
+
+player = pygame.Rect(WIDTH//2-25, HEIGHT-160, 50, 50)
+player_surf = None
+
+bullets = []
+enemy_bullets = []
+enemies = []
+drops = []
+
+boss = None
+boss_hp = 0.0
+boss_max_hp = 0.0
+boss_active = False
+boss_pending_spawn = False
+boss_pending_since = 0
+boss_last_attack = 0
+boss_minions = []
+
+allies = []
+ally_bullets = []
+
+BULLET_PALETTE = [(255,220,60),(80,230,150),(200,120,255)]
+bullet_surfs = []
+shield_surf = None
+enemy_surfs = []
+BG_PALETTES = [
+    ((6,6,20),(18,36,80)),
+    ((12,6,30),(30,40,100)),
+    ((8,18,40),(40,18,80)),
+    ((20,8,18),(120,40,20)),
+    ((8,20,40),(10,60,120)),
+    ((30,10,50),(60,14,80)),
+    ((10,40,10),(20,80,40)),
+    ((60,10,10),(120,40,40)),
+    ((6,30,50),(18,100,170)),
+    ((30,0,30),(90,20,90))
+]
+
+stars = []
+particles = deque(maxlen=MAX_PARTICLES)
+
+# ---------------- SFX LOADING ----------------
+sfx_shoot = None
+sfx_explosion = None
+sfx_levelup = None
+sfx_player_death = None
+
+def load_sfx():
+    global sfx_shoot, sfx_explosion, sfx_levelup, sfx_player_death
+    def try_load(path, vol=0.7):
+        if not pygame.mixer.get_init():
+            return None
+        if not os.path.exists(path):
+            return None
+        try:
+            s = pygame.mixer.Sound(path)
+            s.set_volume(vol)
+            return s
+        except Exception:
+            return None
+    sfx_shoot = try_load(SFX_SHOOT_FILE, 0.45)
+    sfx_explosion = try_load(SFX_EXPLOSION_FILE, 0.6)
+    sfx_levelup = try_load(SFX_LEVELUP_FILE, 0.7)
+    sfx_player_death = try_load(SFX_PLAYER_DEATH_FILE, 0.8)
+
+def play_sfx(snd):
+    if snd:
+        try:
+            snd.play()
+        except Exception:
+            pass
+
+# crea carpeta sfx si no existe (no descarga sonidos)
+if not os.path.exists(SFX_FOLDER):
+    try:
+        os.makedirs(SFX_FOLDER, exist_ok=True)
+    except Exception:
+        pass
+
+load_sfx()
+
+# ---------------- SAVE / LOAD ----------------
+def load_progress():
+    global level, score, upgrade_levels, next_upgrade_at, unlocked_levels
+    if os.path.exists(SAVE_FILE):
+        try:
+            with open(SAVE_FILE, "r") as f:
+                data = json.load(f)
+                level = max(1, min(int(data.get("level", 1)), MAX_LEVEL))
+                score = int(data.get("score", 0))
+                ul = data.get("upgrades", {})
+                upgrade_levels["shot"] = int(ul.get("shot", 0))
+                upgrade_levels["firerate"] = int(ul.get("firerate", 0))
+                next_upgrade_at = int(data.get("next_upgrade_at", next_upgrade_at))
+                unlocked_levels = int(data.get("unlocked_levels", unlocked_levels))
+                unlocked_levels = max(1, min(unlocked_levels, MAX_LEVEL))
+        except Exception:
+            level = 1; score = 0; upgrade_levels = {"shot":0,"firerate":0}; next_upgrade_at = 20; unlocked_levels = 1
+    else:
+        level = 1; score = 0; unlocked_levels = 1
+
+def save_progress():
+    try:
+        with open(SAVE_FILE, "w") as f:
+            json.dump({
+                "level": level,
+                "score": score,
+                "upgrades": upgrade_levels,
+                "next_upgrade_at": next_upgrade_at,
+                "unlocked_levels": unlocked_levels
+            }, f)
+    except Exception:
+        pass
+
+load_progress()
+
+# ---------------- PRE-RENDER ASSETS ----------------
+def make_player_surf(w=50,h=50):
+    surf = pygame.Surface((w,h), pygame.SRCALPHA)
+    cx, cy = w//2, h//2
+    pts = [(cx,6), (6, h-6), (w-6, h-6)]
+    pygame.draw.polygon(surf, (10,160,220), pts)
+    pygame.draw.polygon(surf, (0,100,140), pts, 3)
+    pygame.draw.ellipse(surf, (180,230,255), (cx - w//7, cy - h//4, w//3, h//2))
+    pygame.draw.ellipse(surf, (0,0,0), (cx - w//7, cy - h//4, w//3, h//2), 2)
+    pygame.draw.circle(surf, (255,200,80), (cx, h-12), 6)
+    return surf
+
+player_surf = make_player_surf(50,50)
+
+for col in BULLET_PALETTE:
+    bs = pygame.Surface((10,22), pygame.SRCALPHA)
+    pygame.draw.rect(bs, col, (0,0,10,22))
+    pygame.draw.rect(bs, (0,0,0), (0,0,10,22), 1)
+    bullet_surfs.append(bs)
+
+shield_surf = pygame.Surface((34,34), pygame.SRCALPHA)
+pygame.draw.polygon(shield_surf, (30,130,200), [(17,2),(30,10),(26,28),(17,32),(8,28),(4,10)])
+pygame.draw.polygon(shield_surf, (0,0,0), [(17,2),(30,10),(26,28),(17,32),(8,28),(4,10)], 2)
+pygame.draw.circle(shield_surf, (200,240,255), (17,13), 6)
+pygame.draw.circle(shield_surf, (0,60,80), (17,13), 3)
+
+enemy_palettes = [
+    [(220,55,55),(190,30,30),(150,14,14)],
+    [(80,140,220),(60,100,200),(30,60,140)],
+    [(200,180,60),(170,140,50),(130,110,40)],
+    [(130,60,190),(100,30,160),(70,10,120)]
+]
+
+for pal in enemy_palettes:
+    surf = pygame.Surface((48,48), pygame.SRCALPHA)
+    for i,col in enumerate(pal):
+        pygame.draw.circle(surf, col, (24,24), 16 - i*3)
+    pygame.draw.ellipse(surf, (255,200,200,120), (12,6,16,8))
+    enemy_surfs.append(surf)
+
+# ---------------- STARS & PARTICLES ----------------
+def init_stars():
+    global stars
+    stars = []
+    for _ in range(NUM_STARS):
+        x = random.randrange(0, WIDTH)
+        y = random.randrange(0, HEIGHT)
+        size = random.choice([1,1,1,2])
+        speed = 0.15 + size * 0.12 + random.random()*0.18
+        bright = random.randint(160,255)
+        stars.append({"x": x, "y": y, "size": size, "speed": speed, "bright": bright, "phase": random.random()*math.tau})
+init_stars()
+
+def spawn_particles(x,y,color,count=12,spread=24,vel=1.6):
+    for _ in range(count):
+        angle = random.random()*math.tau
+        speed = vel * (0.4 + random.random()*1.6)
+        particles.append({
+            "x": x + random.randint(-3,3), "y": y + random.randint(-3,3),
+            "dx": math.cos(angle)*speed, "dy": math.sin(angle)*speed,
+            "life": random.randint(20,60), "col": color, "r": random.randint(1,3)
+        })
+
+def update_and_draw_particles(dt):
+    for p in list(particles):
+        p["x"] += p["dx"] * (dt/16)
+        p["y"] += p["dy"] * (dt/16)
+        p["life"] -= 1
+        if p["life"] <= 0:
+            try:
+                particles.remove(p)
+            except ValueError:
+                pass
+            continue
+        alpha = max(30, min(255, int(255 * (p["life"]/60))))
+        surf = pygame.Surface((p["r"]*2,p["r"]*2), pygame.SRCALPHA)
+        surf.fill((*p["col"], alpha))
+        screen.blit(surf, (int(p["x"]), int(p["y"])))
+
+# ---------------- HELPERS ----------------
+def compute_shot_level():
+    return min(1 + upgrade_levels["shot"], MAX_SHOT_LEVEL)
+
+def compute_shot_delay():
+    return max(MIN_SHOT_DELAY, SHOT_DELAY_BASE - 20 * upgrade_levels["firerate"])
+
+def compute_shield_duration():
+    return min(MAX_SHIELD_DURATION, SHIELD_DURATION_BASE + upgrade_levels["shot"]*200)
+
+def clear_playing_entities():
+    global boss, boss_active, boss_hp, boss_max_hp, boss_pending_spawn
+    bullets.clear(); enemy_bullets.clear(); enemies.clear(); drops.clear()
+    allies.clear(); ally_bullets.clear(); boss_minions.clear()
+    boss = None
+    boss_active = False
+    boss_hp = 0.0
+    boss_max_hp = 0.0
+    boss_pending_spawn = False
+
+def spawn_enemy():
+    max_enemies = min(140, BASE_MAX_ENEMIES + level * 3)
+    if level == 1:
+        max_enemies = min(200, BASE_MAX_ENEMIES + EXTRA_ENEMIES_LEVEL1)
+    if len(enemies) >= max_enemies:
+        return
+    w = random.randint(30,56)
+    x = random.randint(18, WIDTH - 18 - w)
+    rect = pygame.Rect(x, -w - random.randint(0,80), w, w)
+    etype = random.randrange(len(enemy_surfs))
+    hp = 1 + level//4 + (1 if etype == 2 else 0)
+    speed = 1.2 + level * 0.12 + random.random() * 0.9
+    enemies.append({"rect": rect, "hp": hp, "speed": speed, "type": etype, "shot_done": False})
+
+def enemy_shoot(e):
+    if e.get("shot_done", False):
+        return
+    angle = math.atan2(player.centery - e["rect"].centery, player.centerx - e["rect"].centerx)
+    sp = 4 + level * 0.18
+    if len(enemy_bullets) < MAX_ENEMY_BULLETS:
+        enemy_bullets.append({"x": e["rect"].centerx, "y": e["rect"].centery, "dx": math.cos(angle)*sp, "dy": math.sin(angle)*sp})
+    e["shot_done"] = True
+
+def spawn_drop(x,y,drop_type=None):
+    drops.append({"type": drop_type, "rect": pygame.Rect(int(x)-13, int(y)-13, 26, 26)})
+
+def spawn_boss_minions_for_level(lv, boss_rect):
+    global boss_minions
+    boss_minions = []
+    count = 2 + lv // 3
+    for i in range(count):
+        angle_off = (i / max(1, count)) * math.tau
+        orbit = boss_rect.width//2 + 36 + i*14
+        size = 28
+        rect = pygame.Rect(int(boss_rect.centerx + math.cos(angle_off)*orbit)-size//2,
+                           int(boss_rect.centery + math.sin(angle_off)*orbit)-size//2,
+                           size, size)
+        boss_minions.append({"rect": rect, "hp": 8 + lv*2, "angle_off": angle_off, "orbit": orbit, "last_shot": 0, "phase": random.random()})
+
+def spawn_boss_for_level(lv):
+    global boss, boss_hp, boss_max_hp, boss_active, boss_last_attack, boss_pending_spawn, invulnerable_until, allies, unlocked_levels
+    boss_active = True
+    boss_pending_spawn = False
+    size = 44 + lv * 8
+    if lv >= MAX_LEVEL:
+        boss_hp_val = 900 + lv * 220
+    else:
+        boss_hp_val = 140 + lv * 120
+    boss_hp_val = int(boss_hp_val)
+    boss_hp = float(boss_hp_val)
+    boss_max_hp = float(boss_hp_val)
+    boss = {"rect": pygame.Rect(WIDTH//2 - size, 90, size*2, size*2), "size": size, "level": lv}
+    boss_last_attack = pygame.time.get_ticks()
+    invulnerable_until = pygame.time.get_ticks() + INVULN_ON_BOSS_SPAWN
+    # limpias balas peligrosas y efectos visuales
+    safe = []
+    for eb in enemy_bullets:
+        dx = eb["x"] - player.centerx; dy = eb["y"] - player.centery
+        if math.hypot(dx,dy) > 110:
+            safe.append(eb)
+    enemy_bullets[:] = safe
+    spawn_particles(WIDTH//2, boss["rect"].centery, (255,200,80), 28, spread=28, vel=2.2)
+    spawn_boss_minions_for_level(lv, boss["rect"])
+    if lv >= MAX_LEVEL:
+        spawn_allies()
+    # sfx de aparición de jefe / fanfarria
+    play_sfx(sfx_levelup)
+
+def spawn_allies():
+    global allies
+    allies.clear()
+    for i in range(4):
+        x = WIDTH//2 + (i-1.5) * 100
+        y = HEIGHT - 300 + random.randint(-10,10)
+        allies.append({"rect": pygame.Rect(int(x)-18, int(y)-18, 36, 36), "last_shot": 0, "hp": 10, "phase": random.random(), "speed": 1.0})
+
+# ---------------- UI / DRAW ----------------
+def draw_background_and_stars(dt, lvl):
+    top, bottom = BG_PALETTES[(lvl-1) % len(BG_PALETTES)]
+    for y in range(0, HEIGHT, 12):
+        t = y / HEIGHT
+        r = int(top[0] * (1-t) + bottom[0] * t)
+        g = int(top[1] * (1-t) + bottom[1] * t)
+        b = int(top[2] * (1-t) + bottom[2] * t)
+        pygame.draw.rect(screen, (r,g,b), (0, y, WIDTH, 12))
+    for s in stars:
+        s["y"] += s["speed"] * (dt/16) * (1 + lvl*0.02)
+        s["phase"] += 0.07 * (dt/16)
+        if s["y"] > HEIGHT + 6:
+            s["y"] = -6; s["x"] = random.randrange(0, WIDTH)
+        flick = int(25 * math.sin(s["phase"]))
+        v = max(80, min(255, s["bright"] + flick))
+        col = (v,v,v)
+        if s["size"] <= 1:
+            screen.fill(col, (int(s["x"]), int(s["y"]), 1, 1))
+        else:
+            pygame.draw.circle(screen, col, (int(s["x"]), int(s["y"])), s["size"])
+
+def draw_player():
+    screen.blit(player_surf, (player.x, player.y))
+    if shield > 0 and pygame.time.get_ticks() - shield_start_time < compute_shield_duration():
+        pygame.draw.circle(screen, (0,150,255), player.center, 40, 3)
+
+def make_boss_surf_for_level(lv, size, t):
+    variant = lv % 4
+    surf = pygame.Surface((size*2, size*2), pygame.SRCALPHA)
+    pulse = 1.0 + 0.06 * math.sin(t * 0.006 + lv)
+    if variant == 0:
+        for i in range(size, 0, -4):
+            col = (200, 40 + (lv*6) % 120, 80 + (i % 40))
+            r = int(i * pulse)
+            pygame.draw.circle(surf, col, (size,size), max(1, r))
+        pygame.draw.circle(surf, (255,255,255), (size - size//3, size - size//4), max(4, size//8))
+        pygame.draw.circle(surf, (255,255,255), (size + size//3, size - size//4), max(4, size//8))
+    elif variant == 1:
+        pts = [(size, 0), (size*2, size), (size, size*2), (0, size)]
+        color = ((60 + lv*10) % 255, (30 + lv*6) % 255, 160)
+        pygame.draw.polygon(surf, color, pts)
+        pygame.draw.polygon(surf, (0,0,0), pts, 3)
+    elif variant == 2:
+        col = ((20 + lv*12) % 255, 160, (120 + lv*8) % 255)
+        pygame.draw.ellipse(surf, col, (int(size*0.1), int(size*0.3), int(size*1.8), int(size*0.9)))
+        pygame.draw.circle(surf, (0,0,0), (size, int(size*0.8)), max(6, size//8))
+    else:
+        base = ((100 + lv*12) % 255, (60 + lv*8) % 255, (200 - lv*6) % 255)
+        for a in range(0, 360, 20):
+            rad = math.radians(a)
+            x = size + math.cos(rad) * (size * 0.95)
+            y = size + math.sin(rad) * (size * 0.95)
+            pygame.draw.circle(surf, base, (int(x), int(y)), max(6, size//10))
+        pygame.draw.circle(surf, (0,0,0), (size,size), max(6,size//6))
+    return surf
+
+# ---------------- UPGRADE MENU ----------------
+upgrade_buttons = []
+def open_upgrade_menu():
+    global upgrade_buttons
+    upgrade_buttons = []
+    w = 420; h = 80; x = WIDTH//2 - w//2; y = HEIGHT//2 - 140
+    opt_texts = [
+        f"Mejorar Balas ({upgrade_levels['shot']}/{MAX_SHOT_LEVEL}) -> +1 bala",
+        f"Mejorar Cadencia ({upgrade_levels['firerate']}/{UPGRADE_MAX_LEVEL}) -> -20ms"
+    ]
+    for i,t in enumerate(opt_texts):
+        rect = pygame.Rect(x, y + i*(h+16), w, h)
+        upgrade_buttons.append((rect, t))
+
+def apply_upgrade(idx):
+    global next_upgrade_at
+    key = ("shot", "firerate")[idx]
+    if upgrade_levels[key] < UPGRADE_MAX_LEVEL:
+        upgrade_levels[key] += 1
+    next_upgrade_at += 30
+    save_progress()
+    play_sfx(sfx_levelup)
+
+# ---------------- LEVEL / RESTART HELPERS ----------------
+def boss_trigger_for_level(lv):
+    return max(6, 6 + lv*4)
+
+def restart_level(full_reset_lives=True):
+    global bullets, enemy_bullets, enemies, drops, boss, boss_active, boss_hp, boss_max_hp, boss_pending_spawn, boss_pending_since, allies, ally_bullets, boss_minions, total_kills, enemy_kills_for_boss, shield, shield_start_time, invulnerable_until, lives
+    bullets = []
+    enemy_bullets = []
+    enemies = []
+    drops = []
+    allies = []
+    ally_bullets = []
+    boss_minions = []
+    boss = None
+    boss_active = False
+    boss_hp = 0.0
+    boss_max_hp = 0.0
+    boss_pending_spawn = False
+    boss_pending_since = 0
+    total_kills = 0
+    enemy_kills_for_boss = 0
+    shield = 0.0
+    shield_start_time = pygame.time.get_ticks()
+    if full_reset_lives:
+        lives = MAX_LIVES
+    invulnerable_until = pygame.time.get_ticks() + INVULN_ON_LEVEL_START
+    init_stars()
+
+def start_level(new_level):
+    global level
+    level = new_level
+    restart_level(full_reset_lives=True)
+    save_progress()
+
+def retry_level():
+    restart_level(full_reset_lives=True)
+
+# ---------------- INTRO ----------------
+INTRO_PAGES = [
+    {"title": "La Última Resistencia", "lines": [
+        "Hace años la galaxia ardió en guerra.",
+        "Corporaciones y señores estelares consumieron sistemas enteros."
+    ]},
+    {"title": "Tu Misión", "lines": [
+        "Eres la última nave de la Resistencia — la última esperanza.",
+        "Recorre 10 sectores, derrota enjambres y jefes únicos."
+    ]},
+    {"title": "Advertencia", "lines": [
+        "Solo el jefe final vendrá con aliados; tus aliados aparecen en el último nivel.",
+        "Mejoras, escudos y habilidad te llevarán a la victoria."
+    ]}
+]
+
+# ---------------- MAIN LOOP ----------------
+running = True
+last_shot_time = 0
+SHOT_DELAY = compute_shot_delay()
+shot_level = compute_shot_level()
+spawn_timer = 0
+
+start_level(level)
+
+while running:
+    dt = clock.tick(FPS)
+    now = pygame.time.get_ticks()
+
+    mouse_down_positions = []
+    mouse_up_occurred = False
+    for ev in pygame.event.get():
+        if ev.type == pygame.QUIT:
+            save_progress(); running = False
+        elif ev.type == pygame.MOUSEBUTTONDOWN:
+            mouse_down_positions.append(ev.pos)
+        elif ev.type == pygame.MOUSEBUTTONUP:
+            mouse_up_occurred = True
+
+    # Fondo estrellado animado por nivel
+    draw_background_and_stars(dt, level)
+    update_and_draw_particles(dt)
+
+    # ----- INTRO -----
+    if screen_state == "intro":
+        title = huge_font.render("ARCADE AVIÓN", True, (255,220,80))
+        screen.blit(title, (WIDTH//2 - title.get_width()//2, 36))
+        y = 220
+        for page in INTRO_PAGES:
+            t = big_font.render(page["title"], True, (255,200,80))
+            screen.blit(t, (WIDTH//2 - t.get_width()//2, y)); y += 64
+            for line in page["lines"]:
+                l = font.render(line, True, (230,230,230))
+                screen.blit(l, (WIDTH//2 - l.get_width()//2, y)); y += 30
+            y += 12
+        hint = font.render("Toca para continuar...", True, (180,180,180))
+        screen.blit(hint, (WIDTH//2 - hint.get_width()//2, HEIGHT - 120))
+        pygame.display.flip()
+        for pos in mouse_down_positions:
+            screen_state = "menu"
+        continue
+
+    # ----- MENU -----
+    if screen_state == "menu":
+        title = huge_font.render("ARCADE AVIÓN", True, (255,200,0))
+        screen.blit(title, (WIDTH//2 - title.get_width()//2, 120))
+        subtitle = font.render("La Última Resistencia - Toca para Jugar / Selecciona Nivel", True, (220,220,220))
+        screen.blit(subtitle, (WIDTH//2 - subtitle.get_width()//2, 220))
+        play_btn = pygame.Rect(WIDTH//2-180, 420, 360, 68)
+        lvl_btn = pygame.Rect(WIDTH//2-180, 500, 360, 68)
+        exit_btn = pygame.Rect(WIDTH//2-180, 580, 360, 68)
+        pygame.draw.rect(screen, (0,150,200), play_btn, border_radius=8)
+        pygame.draw.rect(screen, (0,150,200), lvl_btn, border_radius=8)
+        pygame.draw.rect(screen, (200,50,50), exit_btn, border_radius=8)
+        screen.blit(font.render("Jugar (Desde Nivel 1)", True, (0,0,0)), (play_btn.centerx - 110, play_btn.centery - 12))
+        screen.blit(font.render("Seleccionar Nivel", True, (0,0,0)), (lvl_btn.centerx - 80, lvl_btn.centery - 12))
+        screen.blit(font.render("Salir", True, (0,0,0)), (exit_btn.centerx - 20, exit_btn.centery - 12))
+
+        info = font.render(f"Niveles desbloqueados: {unlocked_levels}/{MAX_LEVEL}", True, (220,220,220))
+        screen.blit(info, (WIDTH//2 - info.get_width()//2, HEIGHT - 80))
+
+        for pos in mouse_down_positions:
+            mx,my = pos
+            if play_btn.collidepoint((mx,my)):
+                start_level(1); screen_state = "playing"
+            elif lvl_btn.collidepoint((mx,my)):
+                screen_state = "level_select"
+            elif exit_btn.collidepoint((mx,my)):
+                save_progress(); running = False
+        pygame.display.flip()
+        continue
+
+    # ----- LEVEL SELECT -----
+    if screen_state == "level_select":
+        title = big_font.render("Seleccionar Nivel", True, (255,255,0))
+        screen.blit(title, (WIDTH//2 - title.get_width()//2, 60))
+        btn_w, btn_h = 170, 64; padding = 18; cols = 2
+        start_x = WIDTH//2 - (btn_w*cols + padding*(cols-1))//2
+        y = 160
+        for i in range(1, MAX_LEVEL+1):
+            col = (i-1) % cols
+            row = (i-1) // cols
+            rect = pygame.Rect(start_x + col*(btn_w+padding), y + row*(btn_h+padding), btn_w, btn_h)
+            locked = (i > unlocked_levels)
+            color = (120,120,120) if locked else (0,200,100)
+            pygame.draw.rect(screen, color, rect, border_radius=8)
+            screen.blit(font.render(f"Nivel {i}", True, (0,0,0)), (rect.centerx - 42, rect.centery - 12))
+            if locked:
+                lock_rect = pygame.Rect(rect.centerx+30, rect.centery-18, 24, 24)
+                pygame.draw.rect(screen, (50,50,50), lock_rect, border_radius=6)
+                screen.blit(font.render("🔒", True, (220,220,220)), (lock_rect.x+2, lock_rect.y-6))
+        back = pygame.Rect(20, HEIGHT-80, 140, 48)
+        pygame.draw.rect(screen, (200,50,50), back, border_radius=6)
+        screen.blit(font.render("Volver", True, (0,0,0)), (back.x + 22, back.y + 10))
+
+        for pos in mouse_down_positions:
+            mx,my = pos
+            if back.collidepoint((mx,my)):
+                screen_state = "menu"
+            else:
+                for i in range(1, MAX_LEVEL+1):
+                    col = (i-1) % cols
+                    row = (i-1) // cols
+                    rect = pygame.Rect(start_x + col*(btn_w+padding), y + row*(btn_h+padding), btn_w, btn_h)
+                    locked = (i > unlocked_levels)
+                    if rect.collidepoint((mx,my)):
+                        if not locked:
+                            start_level(i); screen_state = "playing"
+                        break
+        pygame.display.flip()
+        continue
+
+    # ----- PLAYING -----
+    if screen_state == "playing":
+        # pausa por boton
+        for pos in mouse_down_positions:
+            if pause_button.collidepoint(pos):
+                screen_state = "paused"
+
+        # movimiento con mouse
+        if pygame.mouse.get_pressed()[0]:
+            mx,my = pygame.mouse.get_pos()
+            hw, hh = player.width//2, player.height//2
+            mx = max(hw, min(WIDTH - hw, mx)); my = max(hh, min(HEIGHT - hh, my))
+            player.center = (mx,my)
+
+        # disparo por toque o click
+        shooting = False
+        if mouse_down_positions and not any(pause_button.collidepoint(p) for p in mouse_down_positions):
+            shooting = True
+        if pygame.mouse.get_pressed()[0]:
+            shooting = True
+
+        shot_level = compute_shot_level()
+        SHOT_DELAY = compute_shot_delay()
+
+        if shooting and now - last_shot_time > SHOT_DELAY:
+            pal_idx = min(upgrade_levels["shot"], MAX_SHOT_LEVEL-1)
+            color_surf = bullet_surfs[pal_idx]
+            spread = 14
+            if len(bullets) < MAX_PLAYER_BULLETS:
+                for i in range(shot_level):
+                    offset = int((i - (shot_level-1)/2) * spread)
+                    r = pygame.Rect(player.centerx + offset - 4, player.top - 20, 10, 22)
+                    bullets.append({"rect": r, "surf": color_surf})
+            last_shot_time = now
+            play_sfx(sfx_shoot)
+
+        # spawn enemigos (más en nivel 1)
+        base_spawn_chance = min(0.12, 0.006 + level * 0.0035)
+        if level == 1:
+            spawn_chance = min(0.28, base_spawn_chance * 2.6)
+        else:
+            spawn_chance = base_spawn_chance
+        if random.random() < spawn_chance:
+            spawn_enemy()
+
+        # update y dibujar balas del jugador
+        for i in range(len(bullets)-1, -1, -1):
+            b = bullets[i]
+            b["rect"].y -= int(28 * (dt/16))
+            screen.blit(b["surf"], (b["rect"].x, b["rect"].y))
+            if b["rect"].bottom < -OFFSCREEN_MARGIN:
+                bullets.pop(i)
+
+        # update enemigos
+        for i in range(len(enemies)-1, -1, -1):
+            e = enemies[i]
+            r = e["rect"]
+            r.y += e["speed"] * (dt/16)
+            surf = enemy_surfs[e["type"] % len(enemy_surfs)]
+            s = pygame.transform.smoothscale(surf, (r.width, r.height))
+            screen.blit(s, (r.x, r.y))
+            if not e["shot_done"] and r.top > 12 and random.random() < 0.02 + level*0.002:
+                enemy_shoot(e)
+            hit_flag = False
+            for j in range(len(bullets)-1, -1, -1):
+                if r.colliderect(bullets[j]["rect"]):
+                    bullets.pop(j)
+                    e["hp"] -= 1
+                    hit_flag = True
+                    if e["hp"] <= 0:
+                        total_kills += 1
+                        enemy_kills_for_boss += 1
+                        score += 1
+                        spawn_particles(r.centerx, r.centery, (255,150,60), count=10)
+                        play_sfx(sfx_explosion)
+                        if total_kills % 6 == 0:
+                            spawn_drop(r.centerx, r.centery, "life")
+                        if total_kills % 15 == 0:
+                            spawn_drop(r.centerx + random.randint(-8,8), r.centery, "shield")
+                        if total_kills >= next_upgrade_at:
+                            open_upgrade_menu(); screen_state = "upgrade"
+                        enemies.pop(i)
+                    break
+            if not hit_flag:
+                collided_with_ally = False
+                for a in allies:
+                    if r.colliderect(a["rect"]):
+                        a["hp"] -= 2
+                        spawn_particles(a["rect"].centerx, a["rect"].centery, (200,80,80), count=8)
+                        try: enemies.pop(i)
+                        except: pass
+                        collided_with_ally = True
+                        break
+                if collided_with_ally:
+                    continue
+                if r.top > HEIGHT + OFFSCREEN_MARGIN:
+                    enemies.pop(i)
+
+        # drops (vidas / escudo)
+        for i in range(len(drops)-1, -1, -1):
+            d = drops[i]
+            d["rect"].y += int(4 * (dt/16))
+            if d["type"] == "life":
+                cx, cy = d["rect"].center
+                pygame.draw.circle(screen, (255,0,0), (cx-6, cy-4), 6)
+                pygame.draw.circle(screen, (255,0,0), (cx+6, cy-4), 6)
+                pygame.draw.polygon(screen, (255,0,0), [(cx-12, cy-2),(cx, cy+10),(cx+12, cy-2)])
+            elif d["type"] == "shield":
+                screen.blit(shield_surf, (d["rect"].x-2, d["rect"].y-2))
+            if player.colliderect(d["rect"]):
+                if d["type"] == "life" and lives < MAX_LIVES:
+                    lives += 1
+                if d["type"] == "shield":
+                    shield += 3.0; shield_start_time = now
+                spawn_particles(d["rect"].centerx, d["rect"].centery, (120,200,255), count=8)
+                drops.pop(i)
+            elif d["rect"].top > HEIGHT + OFFSCREEN_MARGIN:
+                drops.pop(i)
+
+        # enemy bullets
+        for i in range(len(enemy_bullets)-1, -1, -1):
+            eb = enemy_bullets[i]
+            eb["x"] += eb["dx"] * (dt/16)
+            eb["y"] += eb["dy"] * (dt/16)
+            pygame.draw.circle(screen, (255,120,120), (int(eb["x"]), int(eb["y"])), 6)
+            if now < invulnerable_until:
+                dx = eb["x"] - player.centerx; dy = eb["y"] - player.centery
+                if math.hypot(dx,dy) < 36:
+                    try: enemy_bullets.pop(i)
+                    except: pass
+                continue
+            hit_handled = False
+            for a in allies:
+                if a["rect"].collidepoint(int(eb["x"]), int(eb["y"])):
+                    a["hp"] -= 2
+                    spawn_particles(a["rect"].centerx, a["rect"].centery, (255,90,90), count=8)
+                    try: enemy_bullets.pop(i)
+                    except: pass
+                    hit_handled = True
+                    break
+            if hit_handled:
+                continue
+            if player.collidepoint(int(eb["x"]), int(eb["y"])):
+                if shield > 0 and now - shield_start_time < compute_shield_duration():
+                    shield -= 0.8
+                else:
+                    lives -= 1
+                    spawn_particles(player.centerx, player.centery, (255,80,80), count=12)
+                    if lives <= 0:
+                        play_sfx(sfx_player_death)
+                try: enemy_bullets.pop(i)
+                except: pass
+            elif eb["y"] > HEIGHT + OFFSCREEN_MARGIN or eb["x"] < -OFFSCREEN_MARGIN or eb["x"] > WIDTH + OFFSCREEN_MARGIN:
+                try: enemy_bullets.pop(i)
+                except: pass
+
+        # boss spawn logic: ahora más lento y por nivel
+        if not boss_active and not boss_pending_spawn and enemy_kills_for_boss >= boss_trigger_for_level(level):
+            boss_pending_spawn = True; boss_pending_since = now
+        if boss_pending_spawn and not boss_active and now - boss_pending_since >= BOSS_SPAWN_DELAY_MS:
+            spawn_boss_for_level(level)
+
+        # boss update
+        if boss_active and boss is not None:
+            br = boss["rect"]
+            br.centerx += int((player.centerx - br.centerx) * 0.02)
+            br.centery += int((player.centery - br.centery) * 0.008)
+            surf = make_boss_surf_for_level(boss["level"], boss["size"], now)
+            pulse = 1.0 + 0.06 * math.sin(now * 0.006 + boss["level"])
+            sw = int(surf.get_width() * pulse); sh = int(surf.get_height() * pulse)
+            surf_s = pygame.transform.smoothscale(surf, (sw, sh))
+            screen.blit(surf_s, (br.centerx - sw//2, br.centery - sh//2))
+            bar_w = br.width + 30
+            bar_x = br.centerx - bar_w//2
+            pygame.draw.rect(screen, (30,0,0), (bar_x, br.top - 52, bar_w, 18))
+            if boss_max_hp > 0:
+                hp_ratio = max(0.0, min(1.0, globals().get("boss_hp", 0.0) / globals().get("boss_max_hp", 1.0)))
+                pygame.draw.rect(screen, (255,30,30), (bar_x, br.top - 52, int(bar_w * hp_ratio), 18))
+            if now - boss_last_attack > max(350, 900 - level*30):
+                angle = math.atan2(player.centery - br.centery, player.centerx - br.centerx)
+                shots = 3 + level//4
+                for k in range(shots):
+                    off = (k - shots//2) * 0.08
+                    if len(enemy_bullets) < MAX_ENEMY_BULLETS:
+                        enemy_bullets.append({"x": br.centerx, "y": br.centery, "dx": math.cos(angle+off)*6.5, "dy": math.sin(angle+off)*6.5})
+                boss_last_attack = now
+            for j in range(len(bullets)-1, -1, -1):
+                if boss and boss["rect"].colliderect(bullets[j]["rect"]):
+                    bullets.pop(j)
+                    dmg = 1.0 + 0.1 * (shot_level - 1)
+                    globals()["boss_hp"] = globals().get("boss_hp", 0.0) - dmg
+                    spawn_particles(br.centerx, br.centery, (255,180,60), count=6)
+                    if globals().get("boss_hp", 0.0) <= 0:
+                        spawn_particles(br.centerx, br.centery, (255,120,60), count=44)
+                        play_sfx(sfx_explosion)
+                        play_sfx(sfx_levelup)
+                        boss_active = False; boss = None; enemy_kills_for_boss = 0
+                        if level < MAX_LEVEL:
+                            unlocked_levels = max(unlocked_levels, level+1)
+                            save_progress()
+                            start_level(level + 1)
+                        else:
+                            save_progress(); screen_state = "victory"
+                    break
+
+        # boss minions update
+        if boss_minions:
+            for i in range(len(boss_minions)-1, -1, -1):
+                m = boss_minions[i]
+                if boss is None:
+                    m["rect"].y += int(0.6 * (dt/16))
+                else:
+                    base = 0.002 * now
+                    ang = m["angle_off"] + base + m["phase"]
+                    ox = int(boss["rect"].centerx + math.cos(ang) * m["orbit"])
+                    oy = int(boss["rect"].centery + math.sin(ang) * m["orbit"])
+                    m["rect"].centerx += int((ox - m["rect"].centerx) * 0.18)
+                    m["rect"].centery += int((oy - m["rect"].centery) * 0.18)
+                pygame.draw.circle(screen, (220,80,80), m["rect"].center, m["rect"].width//2)
+                if now - m["last_shot"] > max(420, 700 - level*20):
+                    angt = math.atan2(player.centery - m["rect"].centery, player.centerx - m["rect"].centerx)
+                    spd = 5 + level*0.2
+                    if len(enemy_bullets) < MAX_ENEMY_BULLETS:
+                        enemy_bullets.append({"x": m["rect"].centerx, "y": m["rect"].centery, "dx": math.cos(angt)*spd, "dy": math.sin(angt)*spd})
+                    m["last_shot"] = now
+                hit = False
+                for j in range(len(bullets)-1, -1, -1):
+                    if m["rect"].colliderect(bullets[j]["rect"]):
+                        bullets.pop(j)
+                        m["hp"] -= 3
+                        spawn_particles(m["rect"].centerx, m["rect"].centery, (255,140,60), count=6)
+                        hit = True
+                        break
+                if m["hp"] <= 0:
+                    spawn_particles(m["rect"].centerx, m["rect"].centery, (255,60,60), count=18)
+                    play_sfx(sfx_explosion)
+                    try: boss_minions.pop(i)
+                    except: pass
+                    continue
+                if m["rect"].top > HEIGHT + OFFSCREEN_MARGIN:
+                    try: boss_minions.pop(i)
+                    except: pass
+
+        # aliados (último nivel)
+        if level >= MAX_LEVEL and allies:
+            for idx, a in enumerate(list(allies)):
+                phase = a.get("phase", 0)
+                a["phase"] = phase + 0.02 * (dt/16)
+                bob = int(math.sin(a["phase"] + idx) * 36)
+                target_x = player.centerx + (-120 + idx*80) + bob
+                a['rect'].centerx += int((target_x - a['rect'].centerx) * 0.06)
+                a['rect'].centery += int((player.centery - 220 - a['rect'].centery) * 0.01)
+                pygame.draw.polygon(screen, (120,220,160), [(a['rect'].centerx, a['rect'].top+2),(a['rect'].left, a['rect'].bottom-4),(a['rect'].right, a['rect'].bottom-4)])
+                maxhp = 10
+                hp = max(0, a.get("hp", 0))
+                bar_w = 40
+                bar_x = a['rect'].centerx - bar_w//2
+                pygame.draw.rect(screen, (40,40,40), (bar_x, a['rect'].top - 12, bar_w, 6))
+                if hp > 0:
+                    pygame.draw.rect(screen, (120,255,160), (bar_x, a['rect'].top - 12, int(bar_w * (hp/maxhp)), 6))
+                if now - a['last_shot'] > 420:
+                    target_x, target_y = None, None
+                    if boss_active and boss:
+                        target_x, target_y = boss['rect'].centerx, boss['rect'].centery
+                    elif enemies:
+                        e = random.choice(enemies); target_x, target_y = e['rect'].centerx, e['rect'].centery
+                    if target_x is not None:
+                        ang = math.atan2(target_y - a['rect'].centery, target_x - a['rect'].centerx)
+                        speed = 10
+                        ally_bullets.append({"x": a['rect'].centerx, "y": a['rect'].centery, "dx": math.cos(ang)*speed, "dy": math.sin(ang)*speed})
+                        a['last_shot'] = now
+                if a.get("hp",0) <= 0:
+                    spawn_particles(a['rect'].centerx, a['rect'].centery, (255,40,40), count=18)
+                    try: allies.remove(a)
+                    except: pass
+
+        for i in range(len(ally_bullets)-1, -1, -1):
+            ab = ally_bullets[i]
+            ab["x"] += ab["dx"] * (dt/16)
+            ab["y"] += ab["dy"] * (dt/16)
+            pygame.draw.circle(screen, (120,255,160), (int(ab["x"]), int(ab["y"])), 6)
+            if boss_active and boss and boss["rect"].collidepoint(int(ab["x"]), int(ab["y"])):
+                globals()["boss_hp"] = globals().get("boss_hp",0.0) - 3.5
+                try: ally_bullets.pop(i)
+                except: pass
+                if globals().get("boss_hp",0.0) <= 0:
+                    spawn_particles(boss["rect"].centerx, boss["rect"].centery, (255,120,60), count=40)
+                    play_sfx(sfx_explosion)
+                    boss_active = False; boss = None; enemy_kills_for_boss = 0
+                    unlocked_levels = max(unlocked_levels, level+1 if level < MAX_LEVEL else level)
+                    save_progress()
+                    screen_state = "victory" if level >= MAX_LEVEL else "playing"
+                continue
+            hit_any = False
+            for e in enemies:
+                if e["rect"].collidepoint(int(ab["x"]), int(ab["y"])):
+                    e["hp"] -= 1
+                    try: ally_bullets.pop(i)
+                    except: pass
+                    hit_any = True
+                    break
+            if not hit_any:
+                if ab["y"] < -OFFSCREEN_MARGIN or ab["x"] < -OFFSCREEN_MARGIN or ab["x"] > WIDTH + OFFSCREEN_MARGIN:
+                    try: ally_bullets.pop(i)
+                    except: pass
+
+        # dibujar jugador y UI
+        draw_player()
+        pygame.draw.rect(screen, (200,200,200), pause_button)
+        pygame.draw.line(screen, (0,0,0), (pause_button.x+10, pause_button.y+8), (pause_button.x+10, pause_button.y+32), 4)
+        pygame.draw.line(screen, (0,0,0), (pause_button.x+25, pause_button.y+8), (pause_button.x+25, pause_button.y+32), 4)
+
+        screen.blit(font.render(f"Puntos: {score}", True, (255,255,255)), (16, 18))
+        screen.blit(font.render(f"Nivel: {level}/{MAX_LEVEL}", True, (255,255,255)), (WIDTH - 200, 18))
+        screen.blit(font.render(f"Vidas: {lives}", True, (255,255,255)), (16, HEIGHT - 48))
+        screen.blit(font.render(f"Escudo: {int(shield)}", True, (0,180,240)), (WIDTH - 260, HEIGHT - 48))
+
+        update_and_draw_particles(dt)
+
+        if lives <= 0:
+            save_progress()
+            screen_state = "gameover"
+
+    # ----- PAUSADO -----
+    elif screen_state == "paused":
+        overlay = pygame.Surface((WIDTH, HEIGHT)); overlay.set_alpha(220); overlay.fill((20,20,30))
+        screen.blit(overlay, (0,0))
+        title = big_font.render("PAUSADO", True, (255,255,255))
+        screen.blit(title, (WIDTH//2 - title.get_width()//2, HEIGHT//2 - 140))
+        resume_btn = pygame.Rect(WIDTH//2-120, HEIGHT//2-20, 240, 64)
+        exit_btn = pygame.Rect(WIDTH//2-120, HEIGHT//2+60, 240, 64)
+        pygame.draw.rect(screen, (0,200,0), resume_btn, border_radius=8)
+        pygame.draw.rect(screen, (200,0,0), exit_btn, border_radius=8)
+        screen.blit(font.render("Reanudar", True, (0,0,0)), (resume_btn.centerx - 46, resume_btn.centery - 12))
+        screen.blit(font.render("Salir al Menú", True, (0,0,0)), (exit_btn.centerx - 64, exit_btn.centery - 12))
+        for pos in mouse_down_positions:
+            if resume_btn.collidepoint(pos):
+                screen_state = "playing"
+            elif exit_btn.collidepoint(pos):
+                clear_playing_entities()
+                screen_state = "menu"
+        pygame.display.flip()
+        continue
+
+    # ----- GAME OVER -----
+    elif screen_state == "gameover":
+        overlay = pygame.Surface((WIDTH, HEIGHT)); overlay.set_alpha(220); overlay.fill((10,0,0))
+        screen.blit(overlay, (0,0))
+        msg = big_font.render("GAME OVER", True, (255,255,255))
+        screen.blit(msg, (WIDTH//2 - msg.get_width()//2, HEIGHT//2 - 140))
+        retry_btn = pygame.Rect(WIDTH//2-160, HEIGHT//2-20, 320, 64)
+        resume_btn = pygame.Rect(WIDTH//2-160, HEIGHT//2+60, 320, 64)
+        menu_btn = pygame.Rect(WIDTH//2-160, HEIGHT//2+140, 320, 64)
+        pygame.draw.rect(screen, (0,200,0), retry_btn, border_radius=8)
+        pygame.draw.rect(screen, (0,150,200), resume_btn, border_radius=8)
+        pygame.draw.rect(screen, (200,50,50), menu_btn, border_radius=8)
+        screen.blit(font.render("Reintentar (mismo nivel)", True, (0,0,0)), (retry_btn.centerx - 110, retry_btn.centery - 12))
+        screen.blit(font.render("Retomar (cargar progreso)", True, (0,0,0)), (resume_btn.centerx - 110, resume_btn.centery - 12))
+        screen.blit(font.render("Volver al Menú", True, (0,0,0)), (menu_btn.centerx - 70, menu_btn.centery - 12))
+
+        for pos in mouse_down_positions:
+            if retry_btn.collidepoint(pos):
+                retry_level(); screen_state = "playing"
+            elif resume_btn.collidepoint(pos):
+                load_progress(); start_level(level); screen_state = "playing"
+            elif menu_btn.collidepoint(pos):
+                clear_playing_entities(); screen_state = "menu"
+
+    # ----- MEJORAS -----
+    elif screen_state == "upgrade":
+        overlay = pygame.Surface((WIDTH, HEIGHT)); overlay.set_alpha(220); overlay.fill((8,8,18))
+        screen.blit(overlay, (0,0))
+        title = big_font.render("MEJORAS", True, (255,215,0))
+        screen.blit(title, (WIDTH//2 - title.get_width()//2, 80))
+        if not upgrade_buttons:
+            open_upgrade_menu()
+        for rect, text in upgrade_buttons:
+            pygame.draw.rect(screen, (50,50,200), rect, border_radius=8)
+            pygame.draw.rect(screen, (0,0,0), rect, 2, border_radius=8)
+            label = font.render(text, True, (255,255,255))
+            screen.blit(label, (rect.centerx - label.get_width()//2, rect.centery - label.get_height()//2))
+        hint = font.render("Toca para elegir.", True, (200,200,200))
+        screen.blit(hint, (WIDTH//2 - hint.get_width()//2, HEIGHT - 120))
+        for pos in mouse_down_positions:
+            mx,my = pos
+            for idx,(rect,txt) in enumerate(upgrade_buttons):
+                if rect.collidepoint((mx,my)):
+                    apply_upgrade(idx); upgrade_buttons = []; screen_state = "playing"; break
+        pygame.display.flip()
+        continue
+
+    # ----- VICTORIA -----
+    elif screen_state == "victory":
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA); overlay.fill((0,0,0,220))
+        screen.blit(overlay, (0,0))
+        txt = "¡VICTORIA!"
+        tmp_font = pygame.font.SysFont("arial", 92)
+        big = tmp_font.render(txt, True, (255, 240, 50))
+        back = pygame.Surface((big.get_width()+120, big.get_height()+120)); back.fill((10,10,30)); back.set_alpha(240)
+        ox = WIDTH//2 - back.get_width()//2; oy = HEIGHT//2 - back.get_height()//2 - 30
+        screen.blit(back, (ox, oy))
+        screen.blit(big, (WIDTH//2 - big.get_width()//2, HEIGHT//2 - big.get_height()//2 - 30))
+        sub = font.render("La Resistencia vive — gracias a tu mando.", True, (220,220,220))
+        screen.blit(sub, (WIDTH//2 - sub.get_width()//2, HEIGHT//2 + 80))
+        hint = font.render("Toca para volver al menú principal", True, (180,180,180))
+        screen.blit(hint, (WIDTH//2 - hint.get_width()//2, HEIGHT//2 + 140))
+        for pos in mouse_down_positions:
+            clear_playing_entities(); screen_state = "menu"
+
+    pygame.display.flip()
+
+# on exit save
+save_progress()
+pygame.quit()
+sys.exit()
