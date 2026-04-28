@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Arcade Avión - La Última Resistencia</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #050816;
+      font-family: Arial, sans-serif;
+      touch-action: none;
+      color: white;
+    }
+
+    body {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+
+    #gameWrap {
+      position: relative;
+      width: 100vw;
+      height: 100vh;
+      max-width: 420px;
+      max-height: 900px;
+      overflow: hidden;
+      background: #050816;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      background: #050816;
+    }
+
+    .hud {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      right: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      pointer-events: none;
+      z-index: 10;
+      font-size: 14px;
+      text-shadow: 0 2px 6px rgba(0,0,0,0.8);
+    }
+
+    .hud .left, .hud .right {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .btn {
+      pointer-events: auto;
+      border: none;
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-weight: bold;
+      background: rgba(255,255,255,0.12);
+      color: white;
+      backdrop-filter: blur(6px);
+    }
+
+    .overlay {
+      position: absolute;
+      inset: 0;
+      display: none;
+      background: rgba(0,0,0,0.72);
+      z-index: 20;
+      padding: 20px;
+      box-sizing: border-box;
+    }
+
+    .panel {
+      width: 100%;
+      max-width: 360px;
+      margin: 0 auto;
+      margin-top: 12vh;
+      background: rgba(10,16,30,0.95);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 18px;
+      padding: 18px;
+      box-sizing: border-box;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+    }
+
+    .panel h1, .panel h2 {
+      margin: 0 0 10px 0;
+      text-align: center;
+    }
+
+    .panel p {
+      margin: 10px 0;
+      line-height: 1.45;
+      color: #d8e3ff;
+      font-size: 14px;
+    }
+
+    .panel .row {
+      display: flex;
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .panel .row .btn {
+      flex: 1;
+      background: #244bff;
+    }
+
+    .panel .row .btn.secondary {
+      background: rgba(255,255,255,0.12);
+    }
+
+    .levelGrid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .levelBtn {
+      padding: 14px 10px;
+      border-radius: 12px;
+      border: none;
+      font-weight: bold;
+      color: white;
+      background: #2a3350;
+    }
+
+    .levelBtn.locked {
+      opacity: 0.45;
+      background: #1c2235;
+    }
+
+    .footerHint {
+      position: absolute;
+      bottom: 14px;
+      left: 0;
+      right: 0;
+      text-align: center;
+      font-size: 12px;
+      opacity: 0.75;
+      z-index: 11;
+      pointer-events: none;
+    }
+
+    .touchBar {
+      position: absolute;
+      left: 10px;
+      right: 10px;
+      bottom: 14px;
+      display: flex;
+      gap: 10px;
+      z-index: 12;
+    }
+
+    .touchBar .btn {
+      flex: 1;
+      padding: 14px 10px;
+      font-size: 16px;
+      background: rgba(255,255,255,0.14);
+    }
+  </style>
+</head>
+<body>
+  <div id="gameWrap">
+    <canvas id="game"></canvas>
+
+    <div class="hud">
+      <div class="left">
+        <div id="hudScore">Puntos: 0</div>
+        <div id="hudLevel">Nivel: 1/10</div>
+        <div id="hudLives">Vidas: 5</div>
+      </div>
+      <div class="right">
+        <button class="btn" id="pauseBtn">Pausa</button>
+      </div>
+    </div>
+
+    <div class="touchBar">
+      <button class="btn" id="fireBtn">Disparar</button>
+      <button class="btn" id="menuBtn">Menú</button>
+    </div>
+
+    <div class="overlay" id="menuOverlay" style="display:block;">
+      <div class="panel">
+        <h1>Arcade Avión</h1>
+        <p><b>La Última Resistencia</b></p>
+        <p>Mové tu nave con el dedo o el mouse. Disparás automático y también con el botón.</p>
+        <div class="row">
+          <button class="btn" id="playBtn">Jugar</button>
+          <button class="btn secondary" id="levelsBtn">Niveles</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="overlay" id="levelOverlay">
+      <div class="panel">
+        <h2>Seleccionar nivel</h2>
+        <div class="levelGrid" id="levelGrid"></div>
+        <div class="row">
+          <button class="btn secondary" id="backFromLevels">Volver</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="overlay" id="storyOverlay">
+      <div class="panel">
+        <h2 id="storyTitle">Historia</h2>
+        <p id="storyText">...</p>
+        <div class="row">
+          <button class="btn" id="storyContinue">Continuar</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="overlay" id="pauseOverlay">
+      <div class="panel">
+        <h2>Pausa</h2>
+        <div class="row">
+          <button class="btn" id="resumeBtn">Seguir</button>
+          <button class="btn secondary" id="restartBtn">Reiniciar</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="overlay" id="gameOverOverlay">
+      <div class="panel">
+        <h2>Game Over</h2>
+        <p id="gameOverText"></p>
+        <div class="row">
+          <button class="btn" id="retryBtn">Reintentar</button>
+          <button class="btn secondary" id="goMenuBtn">Menú</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="overlay" id="victoryOverlay">
+      <div class="panel">
+        <h2>Victoria</h2>
+        <p>La Resistencia sobrevivió. Ganaste la guerra.</p>
+        <div class="row">
+          <button class="btn" id="victoryMenuBtn">Menú</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="footerHint">Arrastrá para mover · Toca para disparar</div>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
